@@ -1,314 +1,378 @@
-let API_BASE = '/api';
-let currentUser = null;
-let currentTasks = [];
-let currentFilter = 'all';
+const express = require('express');
+const session = require('express-session');
+const cors = require('cors');
+const bodyParser = require('body-parser');
+const path = require('path');
+const crypto = require('crypto');
+require('dotenv').config();
 
-// Инициализация
-document.addEventListener('DOMContentLoaded', async () => {
-    if (window.Telegram && Telegram.WebApp) {
-        Telegram.WebApp.expand();
-        Telegram.WebApp.ready();
-        
-        const tgUser = Telegram.WebApp.initDataUnsafe.user;
-        if (tgUser) {
-            await authenticateWithTelegram(tgUser);
-        }
+const app = express();
+const PORT = process.env.PORT || 10000;
+
+// Middleware
+app.use(cors());
+app.use(bodyParser.json());
+app.use(bodyParser.urlencoded({ extended: true }));
+app.use(express.static('public'));
+
+// Session middleware (для продакшена нужно использовать Redis или базу данных)
+app.use(session({
+    secret: process.env.SESSION_SECRET || 'telegram-todo-secret-key',
+    resave: false,
+    saveUninitialized: false,
+    cookie: { 
+        secure: process.env.NODE_ENV === 'production',
+        maxAge: 24 * 60 * 60 * 1000 // 24 часа
     }
+}));
+
+// Простая проверка авторизации Telegram
+function validateTelegramAuth(authData) {
+    const botToken = process.env.TELEGRAM_BOT_TOKEN;
     
-    await loadApp();
+    if (!botToken) {
+        console.error('TELEGRAM_BOT_TOKEN not configured');
+        return null;
+    }
+
+    const { hash, ...data } = authData;
+    
+    // Проверяем, что данные не устарели (24 часа)
+    const authDate = parseInt(data.auth_date);
+    const now = Math.floor(Date.now() / 1000);
+    if (now - authDate > 86400) {
+        return null;
+    }
+
+    // Создаем проверочную строку
+    const dataCheckArr = [];
+    Object.keys(data)
+        .sort()
+        .forEach(key => {
+            if (data[key]) {
+                dataCheckArr.push(`${key}=${data[key]}`);
+            }
+        });
+
+    const dataCheckString = dataCheckArr.join('\n');
+    const secretKey = crypto.createHash('sha256').update(botToken).digest();
+    const computedHash = crypto
+        .createHmac('sha256', secretKey)
+        .update(dataCheckString)
+        .digest('hex');
+
+    return computedHash === hash ? data : null;
+}
+
+// Подключение к PostgreSQL
+const { Pool } = require('pg');
+const pool = new Pool({
+    connectionString: process.env.DATABASE_URL,
+    ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false
 });
 
-// Авторизация
-async function authenticateWithTelegram(tgUser) {
+// Инициализация базы данных
+async function initDatabase() {
     try {
-        const response = await fetch(`${API_BASE}/auth/telegram`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                id: tgUser.id,
-                first_name: tgUser.first_name,
-                last_name: tgUser.last_name,
-                username: tgUser.username,
-                auth_date: Math.floor(Date.now() / 1000),
-                hash: Telegram.WebApp.initData
-            })
-        });
+        const client = await pool.connect();
         
-        const data = await response.json();
-        if (data.success) {
-            currentUser = data.user;
-            showNotification('Добро пожаловать!', 'success');
+        // Создаем таблицы
+        await client.query(`
+            CREATE TABLE IF NOT EXISTS users (
+                id SERIAL PRIMARY KEY,
+                telegram_id BIGINT UNIQUE NOT NULL,
+                first_name VARCHAR(255),
+                last_name VARCHAR(255),
+                username VARCHAR(255),
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+            
+            CREATE TABLE IF NOT EXISTS tasks (
+                id SERIAL PRIMARY KEY,
+                user_id BIGINT NOT NULL,
+                title VARCHAR(255) NOT NULL,
+                description TEXT,
+                completed BOOLEAN DEFAULT FALSE,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                priority INT DEFAULT 1,
+                due_date DATE
+            );
+            
+            CREATE INDEX IF NOT EXISTS idx_tasks_user_id ON tasks(user_id);
+            CREATE INDEX IF NOT EXISTS idx_tasks_completed ON tasks(completed);
+        `);
+        
+        console.log('Database initialized successfully');
+        client.release();
+    } catch (error) {
+        console.error('Database initialization error:', error);
+    }
+}
+
+// Вызываем инициализацию при запуске
+initDatabase();
+
+// API Routes
+
+// Авторизация через Telegram
+app.post('/api/auth/telegram', async (req, res) => {
+    try {
+        const authData = req.body;
+        const validatedData = validateTelegramAuth(authData);
+        
+        if (!validatedData) {
+            return res.status(401).json({ success: false, error: 'Invalid authentication' });
         }
+
+        const { id, first_name, last_name, username } = validatedData;
+        
+        // Находим или создаем пользователя
+        const userQuery = `
+            INSERT INTO users (telegram_id, first_name, last_name, username) 
+            VALUES ($1, $2, $3, $4)
+            ON CONFLICT (telegram_id) 
+            DO UPDATE SET 
+                first_name = EXCLUDED.first_name,
+                last_name = EXCLUDED.last_name,
+                username = EXCLUDED.username
+            RETURNING id, telegram_id, first_name, last_name, username;
+        `;
+        
+        const result = await pool.query(userQuery, [id, first_name, last_name, username]);
+        const user = result.rows[0];
+        
+        // Сохраняем в сессии
+        req.session.userId = user.id;
+        req.session.telegramId = user.telegram_id;
+        req.session.userData = {
+            id: user.telegram_id,
+            first_name: user.first_name,
+            last_name: user.last_name,
+            username: user.username
+        };
+
+        res.json({ success: true, user: req.session.userData });
     } catch (error) {
         console.error('Auth error:', error);
+        res.status(500).json({ success: false, error: 'Internal server error' });
     }
-}
+});
 
-// Загрузка приложения
-async function loadApp() {
+// Проверка сессии
+app.get('/api/auth/check', (req, res) => {
+    if (req.session.userId && req.session.userData) {
+        res.json({ success: true, user: req.session.userData });
+    } else {
+        res.json({ success: false, user: null });
+    }
+});
+
+// Выход
+app.post('/api/auth/logout', (req, res) => {
+    req.session.destroy();
+    res.json({ success: true });
+});
+
+// Задачи
+app.get('/api/tasks', async (req, res) => {
     try {
-        const response = await fetch(`${API_BASE}/auth/check`);
-        const data = await response.json();
-        
-        if (data.success && data.user) {
-            currentUser = data.user;
-            renderMainApp();
-            await loadTasks();
-        } else {
-            renderLoginScreen();
+        if (!req.session.userId) {
+            return res.status(401).json({ success: false, error: 'Not authenticated' });
         }
-    } catch (error) {
-        console.error('Auth check error:', error);
-        renderLoginScreen();
-    }
-}
 
-// Основные функции (упрощенные версии)
-function renderMainApp() {
-    const app = document.getElementById('app');
-    
-    app.innerHTML = `
-        <header>
-            <div class="user-info">
-                <div class="avatar">
-                    ${getAvatarInitials(currentUser.first_name, currentUser.last_name)}
-                </div>
-                <div class="user-details">
-                    <h2>${escapeHtml(currentUser.first_name + ' ' + (currentUser.last_name || ''))}</h2>
-                    <p>@${escapeHtml(currentUser.username || 'user')}</p>
-                </div>
-            </div>
-            <button class="logout-btn" onclick="logout()">Выйти</button>
-        </header>
-        
-        <main>
-            <div class="add-task-section">
-                <input type="text" id="taskTitle" placeholder="Название задачи..." maxlength="255">
-                <button onclick="addTask()">➕ Добавить задачу</button>
-            </div>
-            
-            <div class="controls">
-                <div class="filters">
-                    <button class="filter-btn ${currentFilter === 'all' ? 'active' : ''}" onclick="setFilter('all')">Все</button>
-                    <button class="filter-btn ${currentFilter === 'active' ? 'active' : ''}" onclick="setFilter('active')">Активные</button>
-                    <button class="filter-btn ${currentFilter === 'completed' ? 'active' : ''}" onclick="setFilter('completed')">Завершенные</button>
-                </div>
-            </div>
-            
-            <div class="stats" id="stats">
-                Загрузка...
-            </div>
-            
-            <div id="tasksList" class="tasks-list">
-                <!-- Задачи будут здесь -->
-            </div>
-            
-            <div id="emptyState" class="empty-state" style="display: none;">
-                📝 У вас пока нет задач. Добавьте первую!
-            </div>
-        </main>
-        
-        <footer>
-            <p>ToDo List Mini App &copy; ${new Date().getFullYear()}</p>
-        </footer>
-    `;
-}
+        const { filter = 'all', order = 'created_at', direction = 'DESC' } = req.query;
+        const userId = req.session.userId;
 
-function renderLoginScreen() {
-    const app = document.getElementById('app');
-    app.innerHTML = `
-        <div class="login-screen">
-            <h1>📝 ToDo List</h1>
-            <p>Войдите через Telegram для использования приложения</p>
-            <p class="note">Откройте это приложение через Telegram бота</p>
-            <button onclick="location.reload()" class="refresh-btn">Обновить страницу</button>
-        </div>
-    `;
-}
+        let whereClause = 'WHERE user_id = $1';
+        let queryParams = [userId];
 
-async function loadTasks() {
-    try {
-        const response = await fetch(`${API_BASE}/tasks?filter=${currentFilter}`);
-        const data = await response.json();
-        
-        if (data.success) {
-            currentTasks = data.tasks;
-            displayTasks(currentTasks);
-            updateStats(data.stats);
+        if (filter === 'active') {
+            whereClause += ' AND completed = FALSE';
+        } else if (filter === 'completed') {
+            whereClause += ' AND completed = TRUE';
         }
-    } catch (error) {
-        console.error('Load tasks error:', error);
-        showNotification('Ошибка загрузки задач', 'error');
-    }
-}
 
-function displayTasks(tasks) {
-    const tasksList = document.getElementById('tasksList');
-    const emptyState = document.getElementById('emptyState');
-    
-    if (tasks.length === 0) {
-        tasksList.innerHTML = '';
-        if (emptyState) emptyState.style.display = 'block';
-        return;
-    }
-    
-    if (emptyState) emptyState.style.display = 'none';
-    
-    tasksList.innerHTML = tasks.map(task => `
-        <div class="task-item ${task.completed ? 'completed' : ''}" data-id="${task.id}">
-            <div class="checkbox ${task.completed ? 'checked' : ''}" 
-                 onclick="toggleTask(${task.id}, ${!task.completed})">
-                ${task.completed ? '✓' : ''}
-            </div>
-            <div class="task-content">
-                <div class="task-title">
-                    <span>${escapeHtml(task.title)}</span>
-                </div>
-                ${task.description ? `<div class="task-description">${escapeHtml(task.description)}</div>` : ''}
-                <div class="task-meta-info">
-                    <span>📅 ${formatDate(task.created_at)}</span>
-                </div>
-            </div>
-            <div class="task-actions">
-                <button class="delete-btn" onclick="deleteTask(${task.id})">🗑️</button>
-            </div>
-        </div>
-    `).join('');
-}
+        const query = `
+            SELECT * FROM tasks 
+            ${whereClause} 
+            ORDER BY ${order} ${direction}
+        `;
 
-async function addTask() {
-    const titleInput = document.getElementById('taskTitle');
-    const title = titleInput.value.trim();
-    
-    if (!title) {
-        showNotification('Введите название задачи', 'warning');
-        return;
-    }
-    
-    try {
-        const response = await fetch(`${API_BASE}/tasks`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ title })
+        const result = await pool.query(query, queryParams);
+        
+        // Статистика
+        const statsQuery = `
+            SELECT 
+                COUNT(*) as total,
+                SUM(CASE WHEN completed = TRUE THEN 1 ELSE 0 END) as completed,
+                SUM(CASE WHEN completed = FALSE THEN 1 ELSE 0 END) as active
+            FROM tasks 
+            WHERE user_id = $1;
+        `;
+        
+        const statsResult = await pool.query(statsQuery, [userId]);
+        
+        res.json({
+            success: true,
+            tasks: result.rows,
+            stats: statsResult.rows[0]
         });
-        
-        const data = await response.json();
-        
-        if (data.success) {
-            showNotification('Задача добавлена!', 'success');
-            titleInput.value = '';
-            await loadTasks();
+    } catch (error) {
+        console.error('Get tasks error:', error);
+        res.status(500).json({ success: false, error: 'Failed to get tasks' });
+    }
+});
+
+app.post('/api/tasks', async (req, res) => {
+    try {
+        if (!req.session.userId) {
+            return res.status(401).json({ success: false, error: 'Not authenticated' });
         }
+
+        const { title, description, priority, due_date } = req.body;
+        const userId = req.session.userId;
+
+        if (!title || title.trim() === '') {
+            return res.status(400).json({ success: false, error: 'Title is required' });
+        }
+
+        const query = `
+            INSERT INTO tasks (user_id, title, description, priority, due_date) 
+            VALUES ($1, $2, $3, $4, $5) 
+            RETURNING *;
+        `;
+        
+        const values = [userId, title.trim(), description ? description.trim() : null, priority || 2, due_date || null];
+        const result = await pool.query(query, values);
+        
+        res.json({ success: true, task: result.rows[0] });
     } catch (error) {
         console.error('Add task error:', error);
-        showNotification('Ошибка добавления задачи', 'error');
+        res.status(500).json({ success: false, error: 'Failed to add task' });
     }
-}
+});
 
-async function deleteTask(taskId) {
-    if (!confirm('Удалить задачу?')) return;
-    
+app.put('/api/tasks/:id', async (req, res) => {
     try {
-        const response = await fetch(`${API_BASE}/tasks/${taskId}`, {
-            method: 'DELETE'
-        });
-        
-        const data = await response.json();
-        
-        if (data.success) {
-            showNotification('Задача удалена', 'success');
-            await loadTasks();
+        if (!req.session.userId) {
+            return res.status(401).json({ success: false, error: 'Not authenticated' });
         }
+
+        const taskId = req.params.id;
+        const userId = req.session.userId;
+        const { title, description, completed, priority, due_date } = req.body;
+
+        const query = `
+            UPDATE tasks 
+            SET title = COALESCE($1, title),
+                description = COALESCE($2, description),
+                completed = COALESCE($3, completed),
+                priority = COALESCE($4, priority),
+                due_date = COALESCE($5, due_date)
+            WHERE id = $6 AND user_id = $7
+            RETURNING *;
+        `;
+        
+        const values = [title, description, completed, priority, due_date, taskId, userId];
+        const result = await pool.query(query, values);
+        
+        if (result.rows.length === 0) {
+            return res.status(404).json({ success: false, error: 'Task not found' });
+        }
+
+        res.json({ success: true, task: result.rows[0] });
+    } catch (error) {
+        console.error('Update task error:', error);
+        res.status(500).json({ success: false, error: 'Failed to update task' });
+    }
+});
+
+app.delete('/api/tasks/:id', async (req, res) => {
+    try {
+        if (!req.session.userId) {
+            return res.status(401).json({ success: false, error: 'Not authenticated' });
+        }
+
+        const taskId = req.params.id;
+        const userId = req.session.userId;
+
+        const query = 'DELETE FROM tasks WHERE id = $1 AND user_id = $2 RETURNING *';
+        const result = await pool.query(query, [taskId, userId]);
+        
+        if (result.rows.length === 0) {
+            return res.status(404).json({ success: false, error: 'Task not found' });
+        }
+
+        res.json({ success: true });
     } catch (error) {
         console.error('Delete task error:', error);
-        showNotification('Ошибка удаления задачи', 'error');
+        res.status(500).json({ success: false, error: 'Failed to delete task' });
     }
-}
+});
 
-async function toggleTask(taskId, completed) {
+app.patch('/api/tasks/:id/toggle', async (req, res) => {
     try {
-        const response = await fetch(`${API_BASE}/tasks/${taskId}/toggle`, {
-            method: 'PATCH',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ completed })
-        });
-        
-        const data = await response.json();
-        
-        if (data.success) {
-            await loadTasks();
+        if (!req.session.userId) {
+            return res.status(401).json({ success: false, error: 'Not authenticated' });
         }
+
+        const taskId = req.params.id;
+        const userId = req.session.userId;
+        const { completed } = req.body;
+
+        if (typeof completed !== 'boolean') {
+            return res.status(400).json({ success: false, error: 'Completed status is required' });
+        }
+
+        const query = `
+            UPDATE tasks 
+            SET completed = $1 
+            WHERE id = $2 AND user_id = $3 
+            RETURNING *;
+        `;
+        
+        const result = await pool.query(query, [completed, taskId, userId]);
+        
+        if (result.rows.length === 0) {
+            return res.status(404).json({ success: false, error: 'Task not found' });
+        }
+
+        res.json({ success: true, task: result.rows[0] });
     } catch (error) {
         console.error('Toggle task error:', error);
+        res.status(500).json({ success: false, error: 'Failed to toggle task' });
     }
-}
+});
 
-function setFilter(filter) {
-    currentFilter = filter;
-    document.querySelectorAll('.filter-btn').forEach(btn => btn.classList.remove('active'));
-    const activeBtn = document.querySelector(`button[onclick="setFilter('${filter}')"]`);
-    if (activeBtn) activeBtn.classList.add('active');
-    loadTasks();
-}
-
-function updateStats(stats) {
-    const statsElement = document.getElementById('stats');
-    if (statsElement && stats) {
-        statsElement.innerHTML = `
-            ${stats.total || 0} задач всего, 
-            ${stats.active || 0} активных, 
-            ${stats.completed || 0} завершено
-        `;
-    }
-}
-
-async function logout() {
-    if (!confirm('Выйти?')) return;
-    
+// Инициализация базы данных
+app.get('/init-database', async (req, res) => {
     try {
-        await fetch(`${API_BASE}/auth/logout`, { method: 'POST' });
-        location.reload();
+        await initDatabase();
+        res.send('Database initialized successfully!');
     } catch (error) {
-        console.error('Logout error:', error);
+        console.error('Database initialization error:', error);
+        res.status(500).send('Database initialization failed');
     }
-}
+});
 
-// Вспомогательные функции
-function getAvatarInitials(firstName, lastName) {
-    return (firstName?.charAt(0) || '') + (lastName?.charAt(0) || '');
-}
+// Health check
+app.get('/api/health', (req, res) => {
+    res.json({ 
+        status: 'OK', 
+        timestamp: new Date().toISOString(),
+        environment: process.env.NODE_ENV || 'development'
+    });
+});
 
-function formatDate(dateString) {
-    if (!dateString) return '';
-    return new Date(dateString).toLocaleDateString('ru-RU');
-}
+// Главная страница
+app.get('/', (req, res) => {
+    res.sendFile(path.join(__dirname, 'public', 'index.html'));
+});
 
-function escapeHtml(text) {
-    if (!text) return '';
-    const div = document.createElement('div');
-    div.textContent = text;
-    return div.innerHTML;
-}
-
-function showNotification(message, type = 'info') {
-    if (window.Telegram && Telegram.WebApp) {
-        if (type === 'error') {
-            Telegram.WebApp.showAlert(message);
-        } else {
-            Telegram.WebApp.showPopup({
-                title: type === 'success' ? 'Успешно' : 'Информация',
-                message: message,
-                buttons: [{ type: 'ok' }]
-            });
-        }
-    } else {
-        alert(message);
-    }
-}
-
-// Глобальные функции
-window.addTask = addTask;
-window.logout = logout;
-window.setFilter = setFilter;
-window.toggleTask = toggleTask;
-window.deleteTask = deleteTask;
+// Запуск сервера
+app.listen(PORT, () => {
+    console.log(`Server running on port ${PORT}`);
+    console.log(`Environment: ${process.env.NODE_ENV || 'development'}`);
+    console.log(`Database URL: ${process.env.DATABASE_URL ? 'Configured' : 'Not configured'}`);
+});
