@@ -6,69 +6,154 @@ let currentFilter = 'all';
 
 // Инициализация приложения
 document.addEventListener('DOMContentLoaded', async () => {
-    // Инициализация Telegram Web App
+    console.log('DOM loaded');
+    
+    // Проверяем, открыто ли в Telegram Web App
     if (window.Telegram && Telegram.WebApp) {
+        console.log('Telegram Web App detected');
         Telegram.WebApp.expand();
         Telegram.WebApp.ready();
-
-        // Получаем данные пользователя из Telegram
-        const tgUser = Telegram.WebApp.initDataUnsafe.user;
-        if (tgUser) {
-            await authenticateWithTelegram(tgUser);
+        console.log('WebApp ready, initData:', Telegram.WebApp.initData);
+        console.log('WebApp initDataUnsafe:', Telegram.WebApp.initDataUnsafe);
+        
+        // Устанавливаем тему Telegram
+        if (Telegram.WebApp.colorScheme === 'dark') {
+            document.documentElement.setAttribute('data-theme', 'dark');
         }
     }
-
+    
     // Загружаем начальный интерфейс
     await loadApp();
 });
 
 // Авторизация через Telegram
-async function authenticateWithTelegram(tgUser) {
+async function authenticateWithTelegram(tgUser, initData) {
     try {
+        console.log('Authenticating with Telegram:', tgUser);
+        
+        const authData = {
+            id: tgUser.id,
+            first_name: tgUser.first_name || '',
+            last_name: tgUser.last_name || '',
+            username: tgUser.username || '',
+            auth_date: Telegram.WebApp.initDataUnsafe.auth_date || Math.floor(Date.now() / 1000),
+            hash: initData || Telegram.WebApp.initData
+        };
+
+        console.log('Sending auth data:', authData);
+
         const response = await fetch(`${API_BASE}/auth/telegram`, {
             method: 'POST',
             headers: {
                 'Content-Type': 'application/json',
             },
-            body: JSON.stringify({
-                id: tgUser.id,
-                first_name: tgUser.first_name,
-                last_name: tgUser.last_name,
-                username: tgUser.username,
-                auth_date: Math.floor(Date.now() / 1000),
-                hash: Telegram.WebApp.initData
-            })
+            body: JSON.stringify(authData)
         });
 
         const data = await response.json();
+        console.log('Auth response:', data);
+        
         if (data.success) {
             currentUser = data.user;
             showNotification('Добро пожаловать!', 'success');
+            return true;
+        } else {
+            showNotification('Ошибка авторизации: ' + (data.error || 'Unknown error'), 'error');
+            return false;
         }
     } catch (error) {
         console.error('Auth error:', error);
         showNotification('Ошибка авторизации', 'error');
+        return false;
+    }
+}
+
+// Тестовая авторизация (для разработки)
+async function testAuth() {
+    try {
+        console.log('Trying test auth...');
+        const response = await fetch(`${API_BASE}/auth/test`, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({
+                id: 123456789,
+                first_name: 'Test',
+                last_name: 'User',
+                username: 'testuser'
+            })
+        });
+        
+        const data = await response.json();
+        console.log('Test auth response:', data);
+        
+        if (data.success) {
+            currentUser = data.user;
+            return true;
+        }
+        return false;
+    } catch (error) {
+        console.error('Test auth error:', error);
+        return false;
     }
 }
 
 // Загрузка основного интерфейса
 async function loadApp() {
     const app = document.getElementById('app');
+    
+    // Показываем заглушку
+    app.innerHTML = `
+        <div class="loading">
+            <h2>Загрузка...</h2>
+            <p>Пожалуйста, подождите</p>
+        </div>
+    `;
 
-    // Проверяем авторизацию
     try {
-        const response = await fetch(`${API_BASE}/auth/check`);
-        const data = await response.json();
-
-        if (data.success && data.user) {
-            currentUser = data.user;
+        // Сначала проверяем существующую сессию
+        const checkResponse = await fetch(`${API_BASE}/auth/check`);
+        const checkData = await checkResponse.json();
+        
+        console.log('Session check:', checkData);
+        
+        if (checkData.success && checkData.user) {
+            currentUser = checkData.user;
             renderMainApp();
             await loadTasks();
-        } else {
-            renderLoginScreen();
+            return;
         }
+        
+        // Если нет сессии, пробуем авторизоваться через Telegram
+        if (window.Telegram && Telegram.WebApp && Telegram.WebApp.initDataUnsafe.user) {
+            const tgUser = Telegram.WebApp.initDataUnsafe.user;
+            console.log('Telegram user detected:', tgUser);
+            
+            const authSuccess = await authenticateWithTelegram(tgUser, Telegram.WebApp.initData);
+            if (authSuccess) {
+                renderMainApp();
+                await loadTasks();
+                return;
+            }
+        }
+        
+        // Если Telegram не доступен, пробуем тестовую авторизацию (только для разработки)
+        if (window.location.search.includes('test=true')) {
+            console.log('Trying test mode...');
+            const testSuccess = await testAuth();
+            if (testSuccess) {
+                renderMainApp();
+                await loadTasks();
+                return;
+            }
+        }
+        
+        // Если ничего не сработало, показываем экран входа
+        renderLoginScreen();
+        
     } catch (error) {
-        console.error('Auth check error:', error);
+        console.error('Load app error:', error);
         renderLoginScreen();
     }
 }
@@ -118,6 +203,7 @@ function renderMainApp() {
                         <option value="created_at-ASC">Сначала старые</option>
                         <option value="priority-DESC">По приоритету</option>
                         <option value="due_date-ASC">По дате</option>
+                        <option value="title-ASC">По названию (А-Я)</option>
                     </select>
                 </div>
             </div>
@@ -146,6 +232,9 @@ function renderMainApp() {
     if (dueDateInput) {
         dueDateInput.min = today;
     }
+    
+    // Устанавливаем сегодняшнюю дату по умолчанию
+    dueDateInput.value = today;
 }
 
 // Рендер экрана входа
@@ -157,36 +246,63 @@ function renderLoginScreen() {
             <h1>📝 ToDo List</h1>
             <p>Войдите через Telegram для использования приложения</p>
             
-            ${window.Telegram && Telegram.WebApp ? `
-                <div class="telegram-login">
-                    <p>Откройте это приложение через Telegram</p>
-                    <p class="note">Используйте кнопку меню в Telegram боте</p>
-                </div>
-            ` : `
-                <div class="web-login">
-                    <p>Это приложение работает только через Telegram Mini Apps</p>
-                    <p class="note">Откройте его через Telegram бота</p>
-                </div>
-            `}
-            
-            <button onclick="location.reload()" class="refresh-btn">Обновить страницу</button>
+            <div class="login-options">
+                ${window.Telegram && Telegram.WebApp ? `
+                    <div class="telegram-login">
+                        <p>Вы открыли приложение через Telegram</p>
+                        <p class="note">Если авторизация не сработала автоматически:</p>
+                        <button onclick="location.reload()" class="refresh-btn">Обновить страницу</button>
+                    </div>
+                ` : `
+                    <div class="web-login">
+                        <p>Это приложение работает только через Telegram Mini Apps</p>
+                        <p class="note">Откройте его через Telegram бота</p>
+                        <a href="https://t.me/${process.env.TELEGRAM_BOT_USERNAME || 'your_bot_username'}" 
+                           target="_blank" class="telegram-btn">
+                           📲 Открыть в Telegram
+                        </a>
+                    </div>
+                `}
+                
+                <!-- Только для разработки -->
+                ${process.env.NODE_ENV !== 'production' ? `
+                    <div class="test-login">
+                        <p class="note">Режим разработки</p>
+                        <button onclick="testAuthAndReload()" class="test-btn">
+                            🔧 Тестовая авторизация
+                        </button>
+                    </div>
+                ` : ''}
+            </div>
         </div>
     `;
+}
+
+async function testAuthAndReload() {
+    const success = await testAuth();
+    if (success) {
+        location.reload();
+    }
 }
 
 // Загрузка задач
 async function loadTasks() {
     try {
-        const [order, direction] = document.getElementById('sortOrder')?.value.split('-') || ['created_at', 'DESC'];
+        const sortSelect = document.getElementById('sortOrder');
+        const [order, direction] = sortSelect ? sortSelect.value.split('-') : ['created_at', 'DESC'];
 
         const response = await fetch(
-            `${API_BASE}/tasks?filter=${currentFilter}&order=${order}&direction=${direction}`
+            `${API_BASE}/tasks?filter=${currentFilter}&order=${order}&direction=${direction}`,
+            {
+                credentials: 'include'
+            }
         );
 
         const data = await response.json();
+        console.log('Tasks loaded:', data);
 
         if (data.success) {
-            currentTasks = data.tasks;
+            currentTasks = data.tasks || [];
             displayTasks(currentTasks);
             updateStats(data.stats);
         }
@@ -201,8 +317,8 @@ function displayTasks(tasks) {
     const tasksList = document.getElementById('tasksList');
     const emptyState = document.getElementById('emptyState');
 
-    if (tasks.length === 0) {
-        tasksList.innerHTML = '';
+    if (!tasks || tasks.length === 0) {
+        if (tasksList) tasksList.innerHTML = '';
         if (emptyState) emptyState.style.display = 'block';
         return;
     }
@@ -267,6 +383,7 @@ async function addTask() {
             headers: {
                 'Content-Type': 'application/json',
             },
+            credentials: 'include',
             body: JSON.stringify({
                 title,
                 description: description || null,
@@ -284,7 +401,7 @@ async function addTask() {
             titleInput.value = '';
             descriptionInput.value = '';
             prioritySelect.value = '2';
-            dueDateInput.value = '';
+            dueDateInput.value = new Date().toISOString().split('T')[0];
 
             // Загружаем обновленный список задач
             await loadTasks();
@@ -315,7 +432,7 @@ async function editTask(taskId) {
                         <option value="2" ${task.priority === 2 ? 'selected' : ''}>🟡 Средний</option>
                         <option value="1" ${task.priority === 1 ? 'selected' : ''}>🟢 Низкий</option>
                     </select>
-                    <input type="date" id="editDueDate" value="${task.due_date || ''}">
+                    <input type="date" id="editDueDate" value="${task.due_date || new Date().toISOString().split('T')[0]}">
                 </div>
                 <div class="modal-actions">
                     <button onclick="saveTaskEdit(${taskId})">Сохранить</button>
@@ -356,6 +473,7 @@ async function saveTaskEdit(taskId) {
             headers: {
                 'Content-Type': 'application/json',
             },
+            credentials: 'include',
             body: JSON.stringify({
                 title,
                 description: description || null,
@@ -385,7 +503,8 @@ async function deleteTask(taskId) {
 
     try {
         const response = await fetch(`${API_BASE}/tasks/${taskId}`, {
-            method: 'DELETE'
+            method: 'DELETE',
+            credentials: 'include'
         });
 
         const data = await response.json();
@@ -408,6 +527,7 @@ async function toggleTask(taskId, completed) {
             headers: {
                 'Content-Type': 'application/json',
             },
+            credentials: 'include',
             body: JSON.stringify({ completed })
         });
 
@@ -444,7 +564,7 @@ function updateStats(stats) {
     const statsElement = document.getElementById('stats');
     if (statsElement && stats) {
         statsElement.innerHTML = `
-            <span id="totalTasks">${stats.total || 0}</span> задач всего, 
+            📊 <span id="totalTasks">${stats.total || 0}</span> задач всего, 
             <span id="activeTasks">${stats.active || 0}</span> активных, 
             <span id="completedTasks">${stats.completed || 0}</span> завершено
         `;
@@ -459,7 +579,8 @@ async function logout() {
 
     try {
         await fetch(`${API_BASE}/auth/logout`, {
-            method: 'POST'
+            method: 'POST',
+            credentials: 'include'
         });
 
         location.reload();
@@ -478,7 +599,7 @@ function closeModal() {
 }
 
 function getAvatarInitials(firstName, lastName) {
-    return (firstName?.charAt(0) || '') + (lastName?.charAt(0) || '');
+    return (firstName?.charAt(0) || 'U') + (lastName?.charAt(0) || '');
 }
 
 function getPriorityClass(priority) {
@@ -507,16 +628,24 @@ function getPriorityText(priority) {
 
 function formatDate(dateString) {
     if (!dateString) return '';
-    return new Date(dateString).toLocaleDateString('ru-RU');
+    try {
+        return new Date(dateString).toLocaleDateString('ru-RU');
+    } catch (e) {
+        return dateString;
+    }
 }
 
 function isOverdue(dateString) {
     if (!dateString) return false;
-    const dueDate = new Date(dateString);
-    const today = new Date();
-    today.setHours(0, 0, 0, 0);
-    dueDate.setHours(0, 0, 0, 0);
-    return dueDate < today;
+    try {
+        const dueDate = new Date(dateString);
+        const today = new Date();
+        today.setHours(0, 0, 0, 0);
+        dueDate.setHours(0, 0, 0, 0);
+        return dueDate < today;
+    } catch (e) {
+        return false;
+    }
 }
 
 function escapeHtml(text) {
@@ -533,7 +662,7 @@ function showNotification(message, type = 'info') {
             Telegram.WebApp.showAlert(message);
         } else {
             Telegram.WebApp.showPopup({
-                title: type === 'success' ? 'Успешно' : 'Информация',
+                title: type === 'success' ? 'Успешно' : type === 'warning' ? 'Внимание' : 'Информация',
                 message: message,
                 buttons: [{ type: 'ok' }]
             });
@@ -552,3 +681,4 @@ window.editTask = editTask;
 window.deleteTask = deleteTask;
 window.saveTaskEdit = saveTaskEdit;
 window.closeModal = closeModal;
+window.testAuthAndReload = testAuthAndReload;
