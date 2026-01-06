@@ -10,19 +10,23 @@ const app = express();
 const PORT = process.env.PORT || 10000;
 
 // Middleware
-app.use(cors());
+app.use(cors({
+    origin: true,
+    credentials: true
+}));
 app.use(bodyParser.json());
 app.use(bodyParser.urlencoded({ extended: true }));
 app.use(express.static('public'));
 
-// Session middleware (для продакшена нужно использовать Redis или базу данных)
+// Session middleware
 app.use(session({
     secret: process.env.SESSION_SECRET || 'telegram-todo-secret-key',
     resave: false,
     saveUninitialized: false,
     cookie: { 
         secure: process.env.NODE_ENV === 'production',
-        maxAge: 24 * 60 * 60 * 1000 // 24 часа
+        maxAge: 24 * 60 * 60 * 1000, // 24 часа
+        sameSite: process.env.NODE_ENV === 'production' ? 'none' : 'lax'
     }
 }));
 
@@ -41,6 +45,7 @@ function validateTelegramAuth(authData) {
     const authDate = parseInt(data.auth_date);
     const now = Math.floor(Date.now() / 1000);
     if (now - authDate > 86400) {
+        console.log('Auth data expired:', now - authDate);
         return null;
     }
 
@@ -49,7 +54,7 @@ function validateTelegramAuth(authData) {
     Object.keys(data)
         .sort()
         .forEach(key => {
-            if (data[key]) {
+            if (data[key] !== undefined && data[key] !== null) {
                 dataCheckArr.push(`${key}=${data[key]}`);
             }
         });
@@ -60,6 +65,13 @@ function validateTelegramAuth(authData) {
         .createHmac('sha256', secretKey)
         .update(dataCheckString)
         .digest('hex');
+
+    console.log('Telegram auth validation:', {
+        dataCheckString,
+        computedHash,
+        receivedHash: hash,
+        match: computedHash === hash
+    });
 
     return computedHash === hash ? data : null;
 }
@@ -89,7 +101,7 @@ async function initDatabase() {
             
             CREATE TABLE IF NOT EXISTS tasks (
                 id SERIAL PRIMARY KEY,
-                user_id BIGINT NOT NULL,
+                user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
                 title VARCHAR(255) NOT NULL,
                 description TEXT,
                 completed BOOLEAN DEFAULT FALSE,
@@ -101,6 +113,22 @@ async function initDatabase() {
             
             CREATE INDEX IF NOT EXISTS idx_tasks_user_id ON tasks(user_id);
             CREATE INDEX IF NOT EXISTS idx_tasks_completed ON tasks(completed);
+            
+            -- Функция для обновления updated_at
+            CREATE OR REPLACE FUNCTION update_updated_at_column()
+            RETURNS TRIGGER AS $$
+            BEGIN
+                NEW.updated_at = CURRENT_TIMESTAMP;
+                RETURN NEW;
+            END;
+            $$ language 'plpgsql';
+            
+            -- Триггер для обновления updated_at
+            DROP TRIGGER IF EXISTS update_tasks_updated_at ON tasks;
+            CREATE TRIGGER update_tasks_updated_at
+                BEFORE UPDATE ON tasks
+                FOR EACH ROW
+                EXECUTE FUNCTION update_updated_at_column();
         `);
         
         console.log('Database initialized successfully');
@@ -119,10 +147,58 @@ initDatabase();
 app.post('/api/auth/telegram', async (req, res) => {
     try {
         const authData = req.body;
+        console.log('Received auth data:', authData);
+        
+        // В режиме разработки разрешаем тестовые данные
+        if (process.env.NODE_ENV !== 'production' && authData.hash === 'test_hash_for_development') {
+            console.log('Using test auth data');
+            const testUser = {
+                id: authData.id || 123456789,
+                first_name: authData.first_name || 'Test',
+                last_name: authData.last_name || 'User',
+                username: authData.username || 'testuser'
+            };
+            
+            const userQuery = `
+                INSERT INTO users (telegram_id, first_name, last_name, username) 
+                VALUES ($1, $2, $3, $4)
+                ON CONFLICT (telegram_id) 
+                DO UPDATE SET 
+                    first_name = EXCLUDED.first_name,
+                    last_name = EXCLUDED.last_name,
+                    username = EXCLUDED.username
+                RETURNING id, telegram_id, first_name, last_name, username;
+            `;
+            
+            const result = await pool.query(userQuery, [
+                testUser.id, 
+                testUser.first_name, 
+                testUser.last_name, 
+                testUser.username
+            ]);
+            const user = result.rows[0];
+            
+            req.session.userId = user.id;
+            req.session.telegramId = user.telegram_id;
+            req.session.userData = {
+                id: user.telegram_id,
+                first_name: user.first_name,
+                last_name: user.last_name,
+                username: user.username
+            };
+
+            console.log('Test user authenticated:', user);
+            return res.json({ success: true, user: req.session.userData });
+        }
+        
         const validatedData = validateTelegramAuth(authData);
         
         if (!validatedData) {
-            return res.status(401).json({ success: false, error: 'Invalid authentication' });
+            return res.status(401).json({ 
+                success: false, 
+                error: 'Invalid Telegram authentication',
+                details: 'Hash validation failed'
+            });
         }
 
         const { id, first_name, last_name, username } = validatedData;
@@ -152,15 +228,21 @@ app.post('/api/auth/telegram', async (req, res) => {
             username: user.username
         };
 
+        console.log('User authenticated:', user);
         res.json({ success: true, user: req.session.userData });
     } catch (error) {
         console.error('Auth error:', error);
-        res.status(500).json({ success: false, error: 'Internal server error' });
+        res.status(500).json({ 
+            success: false, 
+            error: 'Internal server error',
+            message: error.message 
+        });
     }
 });
 
 // Проверка сессии
 app.get('/api/auth/check', (req, res) => {
+    console.log('Session check:', req.session);
     if (req.session.userId && req.session.userData) {
         res.json({ success: true, user: req.session.userData });
     } else {
@@ -170,8 +252,12 @@ app.get('/api/auth/check', (req, res) => {
 
 // Выход
 app.post('/api/auth/logout', (req, res) => {
-    req.session.destroy();
-    res.json({ success: true });
+    req.session.destroy((err) => {
+        if (err) {
+            return res.status(500).json({ success: false, error: 'Logout failed' });
+        }
+        res.json({ success: true });
+    });
 });
 
 // Задачи
@@ -184,19 +270,27 @@ app.get('/api/tasks', async (req, res) => {
         const { filter = 'all', order = 'created_at', direction = 'DESC' } = req.query;
         const userId = req.session.userId;
 
-        let whereClause = 'WHERE user_id = $1';
+        let whereClause = 'WHERE t.user_id = $1';
         let queryParams = [userId];
 
         if (filter === 'active') {
-            whereClause += ' AND completed = FALSE';
+            whereClause += ' AND t.completed = FALSE';
         } else if (filter === 'completed') {
-            whereClause += ' AND completed = TRUE';
+            whereClause += ' AND t.completed = TRUE';
         }
 
+        const validOrders = ['created_at', 'updated_at', 'priority', 'due_date', 'title'];
+        const validDirections = ['ASC', 'DESC'];
+
+        const orderBy = validOrders.includes(order) ? order : 'created_at';
+        const orderDirection = validDirections.includes(direction.toUpperCase()) ? direction.toUpperCase() : 'DESC';
+
         const query = `
-            SELECT * FROM tasks 
+            SELECT t.*, u.telegram_id, u.first_name, u.username 
+            FROM tasks t
+            LEFT JOIN users u ON t.user_id = u.id
             ${whereClause} 
-            ORDER BY ${order} ${direction}
+            ORDER BY t.${orderBy} ${orderDirection}
         `;
 
         const result = await pool.query(query, queryParams);
@@ -216,7 +310,7 @@ app.get('/api/tasks', async (req, res) => {
         res.json({
             success: true,
             tasks: result.rows,
-            stats: statsResult.rows[0]
+            stats: statsResult.rows[0] || { total: 0, completed: 0, active: 0 }
         });
     } catch (error) {
         console.error('Get tasks error:', error);
@@ -352,17 +446,74 @@ app.get('/init-database', async (req, res) => {
         res.send('Database initialized successfully!');
     } catch (error) {
         console.error('Database initialization error:', error);
-        res.status(500).send('Database initialization failed');
+        res.status(500).send('Database initialization failed: ' + error.message);
     }
 });
 
 // Health check
-app.get('/api/health', (req, res) => {
-    res.json({ 
-        status: 'OK', 
-        timestamp: new Date().toISOString(),
-        environment: process.env.NODE_ENV || 'development'
-    });
+app.get('/api/health', async (req, res) => {
+    try {
+        // Проверяем подключение к базе данных
+        await pool.query('SELECT 1');
+        
+        res.json({ 
+            status: 'OK', 
+            timestamp: new Date().toISOString(),
+            environment: process.env.NODE_ENV || 'development',
+            database: 'connected'
+        });
+    } catch (error) {
+        res.status(500).json({ 
+            status: 'ERROR', 
+            timestamp: new Date().toISOString(),
+            error: error.message,
+            database: 'disconnected'
+        });
+    }
+});
+
+// Тестовая авторизация (только для разработки)
+app.post('/api/auth/test', async (req, res) => {
+    try {
+        const { id, first_name, last_name, username } = req.body;
+        
+        const userQuery = `
+            INSERT INTO users (telegram_id, first_name, last_name, username) 
+            VALUES ($1, $2, $3, $4)
+            ON CONFLICT (telegram_id) 
+            DO UPDATE SET 
+                first_name = EXCLUDED.first_name,
+                last_name = EXCLUDED.last_name,
+                username = EXCLUDED.username
+            RETURNING id, telegram_id, first_name, last_name, username;
+        `;
+        
+        const result = await pool.query(userQuery, [
+            id || 123456789, 
+            first_name || 'Test', 
+            last_name || 'User', 
+            username || 'testuser'
+        ]);
+        const user = result.rows[0];
+        
+        req.session.userId = user.id;
+        req.session.telegramId = user.telegram_id;
+        req.session.userData = {
+            id: user.telegram_id,
+            first_name: user.first_name,
+            last_name: user.last_name,
+            username: user.username
+        };
+
+        res.json({ success: true, user: req.session.userData });
+    } catch (error) {
+        console.error('Test auth error:', error);
+        res.status(500).json({ 
+            success: false, 
+            error: 'Internal server error',
+            message: error.message 
+        });
+    }
 });
 
 // Главная страница
@@ -375,4 +526,5 @@ app.listen(PORT, () => {
     console.log(`Server running on port ${PORT}`);
     console.log(`Environment: ${process.env.NODE_ENV || 'development'}`);
     console.log(`Database URL: ${process.env.DATABASE_URL ? 'Configured' : 'Not configured'}`);
+    console.log(`Telegram Bot Token: ${process.env.TELEGRAM_BOT_TOKEN ? 'Configured' : 'Not configured'}`);
 });
